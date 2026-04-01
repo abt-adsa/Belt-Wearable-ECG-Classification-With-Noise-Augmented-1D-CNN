@@ -1,8 +1,11 @@
 """
-Pico ECG Acquisition - Production binary protocol.
+Hippy Binary - Deployment Version (Pico)
+=========================================
+Production ECG acquisition with binary protocol
 - MARKER-based sync (6 bytes)
 - 256-sample buffers (0.71s @ 360 Hz)
 - 4 packets = 1024 samples (TFLite input size)
+- Minimal status output
 
 Packet: MARKER (6 bytes) + Data (1536 bytes: 256 × 6 bytes) = 1542 bytes
 """
@@ -15,11 +18,13 @@ import struct
 
 micropython.alloc_emergency_exception_buf(100)
 
+# Configuration
 SAMPLE_RATE_HZ = 360
 ADC_PIN = 26
-BUFFER_SIZE = 256
+BUFFER_SIZE = 256  # 4 packets = 1024 samples for TFLite
 MARKER = b"MARKER"
 
+# Status LED
 led = machine.Pin("LED", machine.Pin.OUT)
 
 class ECGAcquisition:
@@ -29,7 +34,6 @@ class ECGAcquisition:
         self.sample_count = 0
         self.adc_buffer = bytearray(BUFFER_SIZE * 6)
         self.buffer_index = 0
-        self.start_time_ms = 0
         self.timer = machine.Timer()
         self.poll_obj = select.poll()
         self.poll_obj.register(sys.stdin, select.POLLIN)
@@ -37,10 +41,10 @@ class ECGAcquisition:
     def start_recording(self):
         if not self.is_recording:
             led.on()
-            self.is_recording = True
+            # Reset counters FIRST, before any flags or timer
             self.sample_count = 0
             self.buffer_index = 0
-            self.start_time_ms = time.ticks_ms()
+            self.is_recording = True
             
             self.timer.init(
                 mode=machine.Timer.PERIODIC,
@@ -58,11 +62,10 @@ class ECGAcquisition:
                 self._flush_buffer()
     
     def _sample_callback(self, timer):
-        """Timer callback - acquire and buffer samples."""
+        """Timer callback - acquire and buffer samples"""
         if self.buffer_index < BUFFER_SIZE:
             adc_value = self.adc.read_u16()
-            timestamp_ms = time.ticks_add(self.start_time_ms, 
-                                         int((self.sample_count * 1000) / SAMPLE_RATE_HZ))
+            timestamp_ms = (self.sample_count * 1000) // SAMPLE_RATE_HZ
             
             offset = self.buffer_index * 6
             struct.pack_into('<IH', self.adc_buffer, offset, timestamp_ms, adc_value)
@@ -74,7 +77,7 @@ class ECGAcquisition:
                 self._flush_buffer()
     
     def _flush_buffer(self):
-        """Send binary packet with MARKER sync."""
+        """Send binary packet with MARKER sync"""
         data_size = self.buffer_index * 6
         
         try:
@@ -82,12 +85,12 @@ class ECGAcquisition:
             sys.stdout.buffer.write(memoryview(self.adc_buffer)[0:data_size])
             sys.stdout.buffer.flush()
         except:
-            pass
+            pass  # Silently handle I/O errors in interrupt context
         
         self.buffer_index = 0
     
     def check_command(self):
-        """Process commands from receiver."""
+        """Process commands from receiver"""
         if self.poll_obj.poll(0):
             try:
                 line = sys.stdin.readline().strip()
@@ -95,8 +98,11 @@ class ECGAcquisition:
                     command = line.upper()
                     
                     if command == "START":
-                        sys.stdout.write("ACK\n")
-                        self.start_recording()
+                        if not self.is_recording:  # Only start if not already recording
+                            sys.stdout.write("ACK\n")
+                            self.start_recording()
+                        else:
+                            sys.stdout.write("ALREADY_RECORDING\n")
                     elif command == "STOP":
                         sys.stdout.write("ACK\n")
                         self.stop_recording()
